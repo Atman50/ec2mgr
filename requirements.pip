@@ -1,0 +1,5 @@
+# A pip file of required packages to run tools from this directory
+paramkiko
+boto3
+pyyaml
+pexpect

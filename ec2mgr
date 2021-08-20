@@ -1,0 +1,432 @@
+#!/bin/env python3
+#
+""" This is a manager for ec2 instances. It is meant as a way to 'replace' the vagrant functionality in
+an easy to use and maintain way leveraging the excellent and always updated AWS Python SDK
+
+This ec2mgr is driven from a yaml file that has the following construct. Note that simple environment
+variables can be used in the .aws (yaml file). If a referenced environment variable is not found, the
+script with fail with an error. Environment variables are used via: ${<env-var>}
+
+    # For the EC2 client session
+    region_name: us-east-1
+
+    # For the instance creation
+    ImageId: ami-01de8abcdabcdabcd
+    InstanceType: t2.micro
+    SecurityGroups:
+      - ssh
+    KeyName: ${EC2_KEY_NAME}
+    EnclaveOptions:
+      Enabled: True
+    BlockDeviceMappings:
+      - DeviceName: /dev/sda1
+        Ebs:
+          VolumeSize: 256
+          DeleteOnTermination: True
+
+    # Make WaitFor:
+    #    ok - to wait for the system to be ok (no longer initializing) - this can take a long time (240 seconds...)
+    #    #  - the number of seconds to wait once the system shows as running
+    # If unset, this defaults to 10 seconds:
+    # WaitFor: 10
+    # WaitFor: ok
+
+    # For tagging the instance
+    TagSpecifications:
+      - ResourceType: instance
+        # WARNING! This needs to be the first tag. After this, have at it!
+        Tags:
+          - Key: Name
+            Value: ${USER} - test-system-imager
+          - Key: Owner
+            Value: ${AWS_USER_NAME}
+
+    # For connecting!
+    ssh:
+      username: ubuntu
+      ec2_key_path: ${EC2_KEY_PATH}
+
+    # Here is the machine configuration
+    Configuration:
+      # Each entry in Copy has a Type (Folder or File), a Destination (is a Folder or File based on type), Source, and Exclude
+      - CopyFolder:
+          - Source: ./pubkeys
+            Destination: pubkeys
+      - Shell:
+          - Name: System update
+            Privileged: True
+            Commands: |-
+              # update the OS
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get dist-upgrade -y
+              add-apt-repository ppa:git-core/ppa -y
+              apt-get update
+              apt-get upgrade -y
+              # Disable auto upgrades
+              apt-get remove -y unattended-upgrades
+          - Name: Basic setup
+            Privileged: True
+            Commands: |-
+              apt-get install -q -y zip git python3.8 python3-pip jq libglib2.0-dev build-essential gcc make libmysqlclient-dev libpixman-1-dev npm openjdk-8-jdk-headless
+              python3 -m pip install -U pip
+              pip3 install awscli grpcio-tools junit_xml pyasn1_modules fire cryptography==3.4.7 pexpect ec2-metadata boto3 boto watchtower mysql
+          - Name: Setup Access
+            Privileged: False
+            Commands: |-
+              # So keys are automatically added to ~/.ssh/known_hosts
+              echo 'Host *' > /home/ubuntu/.ssh/config
+              echo '    StrictHostKeyChecking no' >> /home/ubuntu/.ssh/config
+
+              # Setup authorized keys
+              for key in $(ls pubkeys/*.pub); do \
+                  echo importing $key; \
+                  cat $key >> .ssh/authorized_keys; \
+              done
+      - Reboot
+
+It's really that simple
+"""
+
+from argparse import ArgumentParser
+from datetime import datetime
+import re
+import os
+import sys
+import time
+import socket
+import yaml
+import boto3
+import paramiko
+
+
+class EC2Manager:
+    """This class manages our ec2 instance(s)
+    """
+
+    def __init__(self, system_name_root):
+        "Create an EC2Manager instance"
+        self._setup_yaml_reader()       # for the load below...
+        self._system_name_root = system_name_root
+        with open(system_name_root + '.aws', 'r') as yaml_file:
+            self._params = yaml.load(yaml_file.read(), Loader=yaml.FullLoader)
+        self._ec2_client = boto3.client('ec2', region_name=self._params['region_name'])
+        instance_name = self._params['TagSpecifications'][0]['Tags'][0]
+        assert instance_name['Key'] == 'Name', 'The first tag must be "tag:Name"'
+        self._instance_name = instance_name['Value']
+        self._setup_ssh()
+        self._sftp_internal = None      # please use the non-internal form: self._sftp, not self._sftp_internal
+
+    def _setup_ssh(self):
+        """Sets up the ssh client
+        """
+        self._ssh = paramiko.SSHClient()
+        self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    @staticmethod
+    def _setup_yaml_reader():
+        """This little magic here will replace the ${xxx} values from the yaml from the environment
+        """
+        path_matcher = re.compile(r'.*\$\{([^}^{]+)\}')
+
+        def path_constructor(_, node):
+            ''' Extract the matched value, expand env variable, and replace the match '''
+            yaml_value = node.value
+            match = path_matcher.match(yaml_value)
+            if env_var := os.environ.get(match.group(1)):
+                return yaml_value.replace('${' + match.group(1) + '}', env_var)
+            sys.exit(f'ERROR: Environment variable {match.group(1)} undefined in your environment')
+        yaml.add_implicit_resolver('!path', path_matcher)
+        yaml.add_constructor('!path', path_constructor)
+
+    def _find_running_instance(self, field: str = 'InstanceId'):
+        """Find a running instance of this machine
+
+        Keyword Arguments:
+        field: str -- the field to return for the instance (default 'InstanceId')
+
+        Returns the field requested. The default is the 'InstanceId' (the EC2 i-%x instance id)
+        """
+        for reservation in self._ec2_client.describe_instances(Filters=[{'Name': 'tag:Name',
+                                                                         'Values': [self._instance_name]}])['Reservations']:
+            for instance in reservation['Instances']:
+                if instance['State']['Name'] == 'running':
+                    return instance[field]
+        return None
+
+    @property
+    def _sftp(self):
+        """Get the sftp session
+        """
+        if not self._sftp_internal:
+            print('Opening sftp session')
+            self._sftp_internal = self._ssh.open_sftp()
+        return self._sftp_internal
+
+    def _sftp_close(self):
+        """Close only if open
+        """
+        if self._sftp_internal:
+            print('Closing down sftp')
+            self._sftp_internal.close()
+            self._sftp_internal = None
+
+    def _wait_for_ssh(self, sleep_a_little: bool = False):
+        """Wait for ssh to become available
+        Keyword Arguments:
+        instance -- the instance data
+        """
+        print('Waiting for ssh ...', end='', flush=True)
+        public_dns_name = None
+        tries = 60      # 2 second sleeps == 2 minutes
+        while not public_dns_name and tries:
+            if public_dns_name := self._find_running_instance(field='PublicDnsName'):
+                break
+            print('.', end='', flush=True)
+            tries -= 1
+            time.sleep(2)
+        if tries == 0:
+            sys.exit('\nERROR: timed out Waiting for the instance Public DNS name')
+
+        if sleep_a_little:
+            print('Sleeping 10 seconds to let system settle...')
+            time.sleep(10)
+        while tries:
+            try:
+                self._ssh.connect(hostname=public_dns_name,
+                                  username=self._params['ssh']['username'],
+                                  pkey=paramiko.RSAKey.from_private_key_file(self._params['ssh']['ec2_key_path']))
+                print('\n')
+                return
+            except paramiko.BadHostKeyException as bad_host_key_exc:
+                sys.exit(f'Bad host key: {str(bad_host_key_exc)}')
+            except paramiko.AuthenticationException as authentication_exc:
+                sys.exit(f'AuthenticationException: {str(authentication_exc)}')
+            except paramiko.SSHException:
+                print(':', end='', flush=True)
+            except socket.error:
+                print('s', end='', flush=True)
+            tries -= 1
+            time.sleep(2)
+        sys.exit(f'Failed to connect to {public_dns_name} - {self._find_running_instance()}')
+
+    def _configuration_reboot(self, _: list):
+        """Do the reboot command
+        Keyword Arguments:
+        _: list -- a no-op
+        """
+        print('='*80)
+        print('REBOOTING SYSTEM')
+        print('='*80)
+        self._sftp_close()
+        self._ssh.exec_command('sudo /sbin/reboot -f > /dev/null 2>&1 &')
+        self._ssh.close()
+        print('Sleeping 10 seconds')
+        time.sleep(10)
+        self._setup_ssh()
+        self._wait_for_ssh()
+
+    # pylint:disable=too-many-locals
+    def _configuration_copyfolder(self, copy_folder_commands: list):
+        """This implements the 'CopyFolder:' command in 'Configuration:'. It contains one or more
+        copy commands that are consumed here
+
+        Example:
+            CopyFolder:
+              - Source: .
+                Destination: remote_directory
+                Exclude:
+                  - .git*
+                  - build.log
+
+        'Source:' and 'Destination:' are required. 'Source:' is this machine, 'Destination:' is the
+        foreign system. 'Exclude:' is optional
+
+        Keyword Arguments:
+        copy_folder_commands: list -- a list of copy commands
+        """
+        sftp = self._sftp         # force creation if necessary
+        for copy_folder_command in copy_folder_commands:
+            try:
+                destination = copy_folder_command['Destination']
+                source = copy_folder_command['Source']
+            except KeyError:
+                sys.exit(f'Cannot find either Source or Destination in CopyFolder command: {copy_folder_command}')
+            exclude_list = copy_folder_command.get('Exclude', [])
+            exclude = []
+            for excl in exclude_list:
+                exclude.append(re.compile('^' + excl.replace('.', '\\.') + '.*'))
+            try:
+                print(f'Making destination directory {destination}')
+                sftp.mkdir(destination)
+            except IOError:
+                # Usually means the directory is already there
+                pass
+
+            for root, _, files in os.walk(copy_folder_command['Source']):
+                for file in files:
+                    filename = os.path.join(root, file)
+                    source_filename = filename.replace(source, '')[1:]
+                    for exclude_re in exclude:
+                        if re.search(exclude_re, source_filename):
+                            filename = None
+                            break
+                    if filename:
+                        destination_filename = os.path.join(destination, source_filename)
+                        print('Copying', filename, '-->', destination_filename)
+                        try:
+                            sftp.put(filename, destination_filename)
+                        except FileNotFoundError:
+                            # Means directory might be missing on destination. Create and try again
+                            destination_directory = os.path.dirname(destination_filename)
+                            print('  ... creating destination directory', destination_directory)
+                            sftp.mkdir(destination_directory)
+                            sftp.put(filename, destination_filename)
+
+    def _ssh_exec(self, command: str, sudo: bool = True, user: str = None):
+        """Do a command
+        Keyword Arguments:
+        command:str -- the command to run
+        sudo:bool   -- run it sudo? (default True)
+        user:str    -- the user to use for the sudo command. If not sudo, user is ignored
+        """
+        # First quote all single quotes in the command
+        command = ('sudo ' if sudo else '') + (f'--user {user} ' if user else '') + "bash -c '\n" + command.replace('\'', '\"') + "\n' 2>&1"
+        print('Running command:\n ', '\n    '.join(command.split('\n')))
+        start = datetime.utcnow()
+        stdout = self._ssh.exec_command(command)[1]
+        for line in iter(stdout.readline, ''):
+            print(line, end='')
+        took = datetime.utcnow() - start
+        print(f'\n\nCommand took {took.total_seconds()} seconds ({took})\n')
+
+    def _configuration_shell(self, shell_commands: list):
+        """Do a provisioning step
+        """
+        for shell_command in shell_commands:
+            print('='*80)
+            print(f'Running shell command: {shell_command["Name"]}')
+            print('='*80)
+            self._ssh_exec(command=shell_command['Commands'],
+                           sudo=shell_command.get('Privileged', False),
+                           user=shell_command.get('User', None))
+
+    def _run_configuration(self):
+        """ Run the Configuration section of the .aws file
+        """
+        if 'Configuration' not in self._params:
+            return              # Nothing to do
+        configuration = self._params['Configuration']
+        for config_step in configuration:
+
+            if isinstance(config_step, str):
+                cmd = config_step
+                cmd_arg = []
+            else:
+                cmd = list(config_step.keys())[0]
+                cmd_arg = config_step[cmd]
+            try:
+                getattr(self, '_configuration_' + cmd.lower())(cmd_arg)
+            except AttributeError:
+                sys.exit(f'Configuration action "{cmd}" is not supported')
+
+    def up(self):               # pylint:disable=invalid-name
+        """ Bring up the system
+        """
+        if instance_id := self._find_running_instance():
+            print(f'Instance {instance_id} is already running')
+            return
+        start = datetime.utcnow()
+        # Setup defaults
+        if 'EnclaveOptions' not in self._params:
+            self._params['EnclaveOptions'] = {'Enabled': False}
+        if 'WaitFor' not in self._params:
+            self._params['WaitFor'] = 10
+        # Create the instance
+        instance_dict = self._ec2_client.run_instances(ImageId=self._params['ImageId'],
+                                                       InstanceType=self._params['InstanceType'],
+                                                       KeyName=self._params['KeyName'],
+                                                       BlockDeviceMappings=self._params['BlockDeviceMappings'],
+                                                       TagSpecifications=self._params['TagSpecifications'],
+                                                       EnclaveOptions=self._params['EnclaveOptions'],
+                                                       MinCount=1,
+                                                       MaxCount=1)['Instances'][0]
+        instance_id = instance_dict['InstanceId']
+        print(f'Created instance {instance_id} named "{self._instance_name}"\n    waiting until running')
+        boto3.resource('ec2').Instance(instance_id).wait_until_running()
+        print('    instance is running')
+        if self._params['WaitFor'] == 'ok':
+            print('    waiting out initializing', end='', flush=True)
+            while True:
+                status = self._ec2_client.describe_instance_status(InstanceIds=[instance_id])['InstanceStatuses'][0]
+                if status['InstanceStatus']['Status'] == 'ok':
+                    break
+                print('.', end='', flush=True)
+                time.sleep(10)
+            print('\n')
+        else:
+            secs = self._params['WaitFor']
+            assert isinstance(secs, int), 'WaitFor must be an integer'
+            print(f'    sleeping {secs} seconds')
+            time.sleep(secs)
+        self._wait_for_ssh()
+        self._run_configuration()
+        took = datetime.utcnow() - start
+        print(f'\n\nOverall time {took.total_seconds()} ({took})\n')
+
+    def save_ami(self):
+        """Save the ami off"""
+        if instance_id := self._find_running_instance():
+            start = datetime.utcnow()
+            image_name = f"my_ami_{self._system_name_root}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            ami_id = self._ec2_client.create_image(InstanceId=instance_id, Name=image_name, NoReboot=False)['ImageId']
+            print(f'Saving off {ami_id} ({image_name})\n waiting for the AMI to become available'
+                  '\n sleeping 90 seconds then checking every 5', end='', flush=True)
+            time.sleep(90)
+            while boto3.resource('ec2').Image(ami_id).state != 'available':
+                print('.', end='', flush=True)
+                time.sleep(5)
+            print(' done')
+            took = datetime.utcnow() - start
+            print(f'\n\nOverall time {took.total_seconds()} ({took})\n')
+
+    def ssh(self):
+        """ SSH to defined to system
+        """
+        if public_dns := self._find_running_instance(field='PublicDnsName'):
+            os.execvp('ssh', f'ssh -i {self._params["ssh"]["ec2_key_path"]} {self._params["ssh"]["username"]}@{public_dns}'.split())
+        sys.exit(f'"{self._instance_name}" is NOT running')
+
+    def destroy(self):
+        """ Kill of the instance
+        """
+        if instance_id := self._find_running_instance():
+            self._ec2_client.terminate_instances(InstanceIds=[instance_id])
+            print(f'Instance {instance_id} terminated')
+        else:
+            sys.exit(f'No instance named "{self._instance_name}" is running')
+
+    def report(self):
+        """ Just get the instance ID if it exists
+        """
+        if instance_id := self._find_running_instance():
+            print(f'Running "{self._instance_name}" is {instance_id}')
+        else:
+            sys.exit(f'"{self._instance_name}" is NOT running')
+
+
+def main():
+    """ Main function
+    """
+    parser = ArgumentParser(description='The ec2mgr approximates vagrant functionality. The name of the system is used to '
+                            'find the .aws (AWS instance defintion) and .ans (ansible configuration) files.')
+    actions = 'save_ami up destroy ssh report'.split()
+    parser.add_argument('action', choices=actions, help=f'The action to perform. One of: {", ".join(actions)}')
+    parser.add_argument('system', help='The name of the system. Used to find .aws and .ans files')
+    args = parser.parse_args()
+    ec2mgr = EC2Manager(args.system)
+    getattr(ec2mgr, args.action)()
+
+
+if __name__ == '__main__':
+    main()

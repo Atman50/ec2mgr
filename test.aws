@@ -1,0 +1,116 @@
+# Environment variables:
+#     export AWS_USER_NAME=user@company.com
+#
+#     export EC2_KEY_NAME=mykeyname
+#     export EC2_KEY_PATH=$HOME/.ssh/mykeyname.pem
+# 
+#     export INSTANCE_KEYS_PATH=$HOME/keys
+#
+
+
+# For the EC2 client session
+region_name: us-east-1
+
+# Describe the AWS instance
+ImageId: ami-01de8ddb33de7a3d3        # A recent Ubuntu 20.04 image
+InstanceType: t2.micro
+SecurityGroups:
+  - my-ssh-security-group
+KeyName: ${EC2_KEY_NAME}
+EnclaveOptions:
+  Enabled: True
+BlockDeviceMappings:
+  - DeviceName: /dev/sda1
+    Ebs:
+      VolumeSize: 256
+      DeleteOnTermination: True
+
+# Make WaitFor:
+#    ok - to wait for the system to be ok (no longer initializing) - this can take a long time (240 seconds...)
+#    #  - the number of seconds to wait once the system shows as running
+# If unset, this defaults to 10 seconds:
+# WaitFor: 10
+# WaitFor: ok
+
+# For tagging the instance
+TagSpecifications:
+  - ResourceType: instance
+    Tags:
+      # WARNING! This needs to be the first tag. After this, have at it!
+      - Key: Name
+        Value: ${USER} - test machine
+      - Key: Owner
+        Value: ${AWS_USER_NAME}
+
+# For connecting!
+ssh:
+  username: ubuntu
+  ec2_key_path: ${EC2_KEY_PATH}
+
+# Here is the machine configuration
+Configuration:
+  # Each entry in Copy has a Type (Folder or File), a Destination (is a Folder or File based on type), Source, and Exclude
+  - CopyFolder:
+      - Source: ./pubkeys
+        Destination: pubkeys
+      - Source: ${INSTANCE_KEYS_PATH}
+        Destination: instance_keys
+  - Shell:
+      - Name: System update
+        Privileged: True
+        Commands: |-
+          # update the OS
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get dist-upgrade -y
+          add-apt-repository ppa:git-core/ppa -y
+          apt-get update
+          apt-get upgrade -y
+          # Disable auto upgrades
+          apt-get remove -y unattended-upgrades
+      - Name: Basic setup
+        Privileged: True
+        Commands: |-
+          # Install some stuff needed for our system
+          apt-get install -q -y zip git python3.8 python3-pip jq build-essential gcc make openjdk-8-jdk-headless
+      - Name: Setup Access
+        Privileged: False
+        Commands: |-
+          # Copy over the instance access keys and credentials
+          cp -r instance_keys/aws .aws
+          chmod 600 .aws/*
+          cp instance_keys/ssh/id_rsa .ssh/id_rsa
+          chmod 600 .ssh/id_rsa
+          cp instance_keys/ssh/id_rsa.pub .ssh/id_rsa.pub
+          chmod 644 .ssh/id_rsa.pub
+
+
+          # So keys are automatically added to ~/.ssh/known_hosts
+          echo 'Host *' > /home/ubuntu/.ssh/config
+          echo '    StrictHostKeyChecking no' >> /home/ubuntu/.ssh/config
+
+          # Setup authorized keys
+          for key in $(ls pubkeys/*.pub); do \
+              echo importing $key; \
+              cat $key >> .ssh/authorized_keys; \
+          done
+
+          # Clean up the keys area and the vagrant files
+          rm -rf instance_keys pubkeys
+      - Name: Install support for sematic-versioning
+        Commands: |-
+          npm install semantic-release @semantic-release/git @semantic-release/exec semantic-release-slack-bot -D
+      - Name: Move nitro-enclave to safe place
+        Privileged: True
+        Commands: |-
+          mkdir -m 0700 /etc/gradient
+          mv nitro_enclave/* /etc/gradient
+          rm -rf nitro_enclave
+          cd /etc/gradient
+          unzip nitro_enclave.zip
+          rm nitro_enclave.zip
+  - Reboot
+  - Shell:
+      - Name: Say we are done
+        Commands: |-
+          echo Done with test.aws build!!!!!
